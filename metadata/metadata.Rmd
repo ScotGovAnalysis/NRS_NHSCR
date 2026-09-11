@@ -1,0 +1,272 @@
+---
+title: "`r if (is.null(params$csv_path) || is.na(params$csv_path)) 'Metadata Report' else
+paste('Metadata Report:', tools::file_path_sans_ext(basename(params$csv_path)))`"
+output:
+  html_document: default
+params:
+  csv_path: !r NA
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r load libraries, include=FALSE}
+library(readr)
+library(glue)
+library(dplyr)
+library(tidyr)
+library(here)
+library(glue)
+library(purrr)
+library(stringr)
+library(ggplot2)
+library(knitr)
+library(janitor)
+library(tools)
+library(rmarkdown)
+library(lubridate)
+library(callr)
+```
+
+```{r load paths and create directories, include=FALSE}
+
+input_data <- load(here("input_data.RData"))
+#Base input and output directories
+#base paths to switch between extracts
+base_migrant_r_path <- glue(out_dir, "Migration_extract_", mig_month, "/")
+  
+base_silc_r_path <-  glue(out_dir, "SILC_Extract_", mig_month, "/")
+
+base_annual_r_path <- here("/mnt", "dl_acp79_modify", paste0("SAS to R - Testing"), 
+                           paste0("Testing_R_codeAnnual_extract_", mig_month, "/"))
+  
+
+#Output directory for outputs
+output_dir <- glue(out_dir, "metadata_outputs_", mig_month)
+  
+
+#create output dir if does not exists
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive=TRUE)
+
+#List all csv files in the folder
+csv_files <- list.files(
+  path = c(base_migrant_r_path, base_silc_r_path, base_annual_r_path),
+  pattern = "\\.csv$",
+  full.names = TRUE
+)
+```
+
+```{r load_dataset, include=FALSE}
+
+if (is.null(params$csv_path) || is.na(params$csv_path)) {
+  walk(csv_files, function(a) {
+    label <- file_path_sans_ext(basename(a))
+    r(
+      function(input, output_file, output_dir, csv_path){
+          rmarkdown::render(
+            input = input,
+            output_file = output_file,
+            output_dir = output_dir,
+            params = list(csv_path = csv_path),
+            envir = new.env()
+          )
+          },
+        args = list(
+          input = "metadata.Rmd",
+          output_file = paste0(label, ".html"),
+          output_dir = output_dir,
+          csv_path = a
+          )
+      )
+      })
+  knit_exit()
+  } else {
+
+path <- params$csv_path
+label <- file_path_sans_ext(basename(base_migrant_r_path))
+df <- read_csv(path, 
+               show_col_types = FALSE, 
+               progress = FALSE) |> 
+  clean_names()
+}
+```
+
+## 1. Structure
+
+*This section shows basic shape of the dataset and the data type of each column*
+
+```{r sturcture_dims, echo=FALSE}
+
+#Basic shape, rows and column count as a simple table
+tibble(
+  metric = c("Rows", "Columns"),
+  value = c(nrow(df), ncol(df)))|> 
+    kable(caption = "Dataset Dimensions")
+```
+
+```{r structure_cols, echo=FALSE}
+#Column names, data types and number of unique values (to spot categorical columns (low unique count))
+col_info <- data.frame(
+  column = names(df),
+  data_type = sapply(df, function(x) class(x)[1]),
+  n_unique = sapply(df, function(x) length(unique(x))),
+  stringsAsFactors = FALSE
+)
+kable(col_info, caption = "Column Structure")
+
+```
+
+## 2. Summary statistics
+
+*Numeric columns only - shows the spread and tendency of each numeric variable*
+
+```{r, echo=FALSE}
+numeric_cols <- df |> 
+  select(where(is.numeric)) |> 
+  names()
+
+if (length(numeric_cols) > 0) {
+  data.frame(
+    column = numeric_cols,
+    minimum = sapply(df[numeric_cols], min, na.rm = TRUE),
+    maximum = sapply(df[numeric_cols], max, na.rm = TRUE),
+    mean = sapply(df[numeric_cols], function(x)
+      round(mean(x, na.rm=TRUE), 2)),
+    median = sapply(df[numeric_cols], median, na.rm = TRUE),
+    row.names = NULL
+  ) |> 
+    kable(caption="Numeric Column Statistics")
+  
+} else {
+  cat("No numeric columns found\n")
+}
+```
+
+## 3. Data Quality
+
+*Checks for missing values, duplicate rows, and blank strings across the dataset.*
+
+```{r missing_values, echo=FALSE}
+#Shows columns with missing values sorted by highest percentage missing first to highlight data gaps
+missing_df <- df |>
+  summarise(across(everything(), ~sum(is.na(.)))) |> 
+  pivot_longer(everything(),
+               names_to = "Column",
+               values_to = "n_missing") |> 
+  filter(n_missing > 0) |> 
+  mutate(percentage_missing = round(n_missing / nrow(df) * 100, 2)) |> 
+  arrange(desc(percentage_missing))
+
+if (nrow(missing_df) == 0) {
+  cat("No missing values found\n")
+} else {
+  kable(missing_df, caption = "Missing values by column") 
+}
+
+```
+
+```{r duplicates, echo=FALSE}
+# counts fully duplicated rows
+n_dupes <- sum(duplicated(df))
+
+tibble(metric = "Duplicated rows",
+       count = n_dupes,
+       percentage = round(100 * n_dupes/nrow(df), 2) 
+) |> 
+  kable()
+
+```
+
+### Blank strings
+
+```{r blank strings, echo=FALSE}
+#Counts blank or whitespaces-only strings per character column
+
+# Fix UTF-8 issue before checking
+df_clean <- df |> 
+  mutate(across(where(is.character),
+                ~iconv(., from= "", to="UTF-8", sub="byte")))
+blank_df <- df_clean |> 
+  summarise(
+    across(
+      where(is.character),
+      ~sum(trimws(.) == "", na.rm = TRUE)
+    )
+  ) |>
+  pivot_longer(
+    everything(),
+    names_to = "Column",
+    values_to = "Blank Strings"
+    ) |>
+  filter('Blank Strings' > 0)
+
+kable(
+  blank_df,
+  caption = "Blank Strings by Column"
+)
+```
+
+## 4. Distributions
+
+*Visual distribution of individuals by sex and age.*
+
+```{r sex_distribution, echo=FALSE}
+sex_col <- intersect(names(df),
+  c("gender", "sex")
+)[1]
+
+if (!is.na(sex_col)) {
+  sex_counts <- df |> 
+    count(.data[[sex_col]], name = "Count") |> 
+    mutate(Percentage = round(100 * Count/sum(Count), 1))
+  kable(sex_counts,
+        caption = "Distribution by Sex")
+  
+  ggplot(sex_counts,
+         aes(x = .data[[sex_col]],
+             y = Count)
+         ) +
+    geom_col(fill = "steelblue") +
+    labs(title = "Distribution by Sex",
+          x = sex_col,
+          y = "Count") +
+    theme_minimal()
+  
+} else {
+  cat("No sex column")
+}
+```
+
+```{r, echo=FALSE}
+if ("birthdate" %in% names(df)) {
+  age_df <- df |> 
+    mutate(
+    age = floor(
+      time_length(
+        interval(
+          birthdate, 
+          coalesce(deathdate, Sys.Date())),
+        "years"
+        ))) |> 
+  filter(!is.na(age), is.finite(age))
+  
+  age_df |> 
+    summarise(
+      min_age = min(age, na.rm=TRUE),
+      max_age = max(age, na.rm=TRUE),
+      mean_age = round(mean(age, na.rm=TRUE), 1)
+  ) |> 
+    kable(caption = "Age Summary")
+  
+  ggplot(age_df, aes(x=age)) +
+  geom_histogram(bins=20, fill="steelblue",
+                 colur="white") +
+  labs(title = "Age Distribution",
+       x = "Age (years)",
+       y = "Count") +
+  theme_minimal()
+} else {
+  cat("No birthdate column found\n")
+}
+```
